@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -47,11 +48,7 @@ func TestNewBot(t *testing.T) {
 	_, err = NewBot(pref)
 	assert.Error(t, err)
 
-	if token == "" {
-		t.Skip("TELEBOT_SECRET is required")
-	}
-
-	b, err := newTestBot()
+	b, err := NewBot(Settings{offline: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,13 +64,16 @@ func TestNewBot(t *testing.T) {
 	pref.Client = client
 	pref.Poller = &LongPoller{Timeout: time.Second}
 	pref.Updates = 50
+	pref.ParseMode = ModeHTML
+	pref.offline = true
 
 	b, err = NewBot(pref)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, client, b.client)
 	assert.Equal(t, pref.URL, b.URL)
 	assert.Equal(t, pref.Poller, b.Poller)
 	assert.Equal(t, 50, cap(b.Updates))
+	assert.Equal(t, ModeHTML, b.parseMode)
 }
 
 func TestBotHandle(t *testing.T) {
@@ -84,9 +84,22 @@ func TestBotHandle(t *testing.T) {
 	b.Handle("/start", func(m *Message) {})
 	assert.Contains(t, b.handlers, "/start")
 
-	btn := &InlineButton{Unique: "test"}
-	b.Handle(btn, func(c *Callback) {})
-	assert.Contains(t, b.handlers, btn.CallbackUnique())
+	reply := ReplyButton{Text: "reply"}
+	b.Handle(&reply, func(m *Message) {})
+
+	inline := InlineButton{Unique: "inline"}
+	b.Handle(&inline, func(c *Callback) {})
+
+	btnReply := (&ReplyMarkup{}).Text("btnReply")
+	b.Handle(&btnReply, func(m *Message) {})
+
+	btnInline := (&ReplyMarkup{}).Data("", "btnInline")
+	b.Handle(&btnInline, func(c *Callback) {})
+
+	assert.Contains(t, b.handlers, btnReply.CallbackUnique())
+	assert.Contains(t, b.handlers, btnInline.CallbackUnique())
+	assert.Contains(t, b.handlers, reply.CallbackUnique())
+	assert.Contains(t, b.handlers, inline.CallbackUnique())
 
 	assert.Panics(t, func() { b.Handle(1, func() {}) })
 }
@@ -108,44 +121,39 @@ func TestBotStart(t *testing.T) {
 	}
 
 	// remove webhook to be sure that bot can poll
-	assert.NoError(t, b.RemoveWebhook())
+	require.NoError(t, b.RemoveWebhook())
 
-	time.AfterFunc(50*time.Millisecond, b.Stop)
-	b.Start() // stops after some delay
-	assert.Empty(t, b.stop)
+	go b.Start()
+	b.Stop()
 
-	tp := &testPoller{updates: make(chan Update, 1)}
+	tp := newTestPoller()
 	go func() {
 		tp.updates <- Update{Message: &Message{Text: "/start"}}
 	}()
 
 	b, err = NewBot(pref)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	b.Poller = tp
 
 	var ok bool
 	b.Handle("/start", func(m *Message) {
 		assert.Equal(t, m.Text, "/start")
+		tp.done <- struct{}{}
 		ok = true
 	})
 
-	time.AfterFunc(100*time.Millisecond, b.Stop)
-	b.Start() // stops after some delay
+	go b.Start()
+	<-tp.done
+	b.Stop()
+
 	assert.True(t, ok)
 }
 
-func TestBotIncomingUpdate(t *testing.T) {
-	if token == "" {
-		t.Skip("TELEBOT_SECRET is required")
-	}
-
-	b, err := newTestBot()
+func TestBotProcessUpdate(t *testing.T) {
+	b, err := NewBot(Settings{Synchronous: true, offline: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	tp := &testPoller{updates: make(chan Update, 1)}
-	b.Poller = tp
 
 	b.Handle("/start", func(m *Message) {
 		assert.Equal(t, "/start", m.Text)
@@ -167,6 +175,9 @@ func TestBotIncomingUpdate(t *testing.T) {
 	})
 	b.Handle(OnAudio, func(m *Message) {
 		assert.NotNil(t, m.Audio)
+	})
+	b.Handle(OnAnimation, func(m *Message) {
+		assert.NotNil(t, m.Animation)
 	})
 	b.Handle(OnDocument, func(m *Message) {
 		assert.NotNil(t, m.Document)
@@ -244,46 +255,43 @@ func TestBotIncomingUpdate(t *testing.T) {
 		assert.Equal(t, "poll", pa.PollID)
 	})
 
-	go func() {
-		tp.updates <- Update{Message: &Message{Text: "/start"}}
-		tp.updates <- Update{Message: &Message{Text: "/start@other_bot"}}
-		tp.updates <- Update{Message: &Message{Text: "hello"}}
-		tp.updates <- Update{Message: &Message{Text: "text"}}
-		tp.updates <- Update{Message: &Message{PinnedMessage: &Message{}}}
-		tp.updates <- Update{Message: &Message{Photo: &Photo{}}}
-		tp.updates <- Update{Message: &Message{Voice: &Voice{}}}
-		tp.updates <- Update{Message: &Message{Audio: &Audio{}}}
-		tp.updates <- Update{Message: &Message{Document: &Document{}}}
-		tp.updates <- Update{Message: &Message{Sticker: &Sticker{}}}
-		tp.updates <- Update{Message: &Message{Video: &Video{}}}
-		tp.updates <- Update{Message: &Message{VideoNote: &VideoNote{}}}
-		tp.updates <- Update{Message: &Message{Contact: &Contact{}}}
-		tp.updates <- Update{Message: &Message{Location: &Location{}}}
-		tp.updates <- Update{Message: &Message{Venue: &Venue{}}}
-		tp.updates <- Update{Message: &Message{GroupCreated: true}}
-		tp.updates <- Update{Message: &Message{UserJoined: &User{}}}
-		tp.updates <- Update{Message: &Message{UsersJoined: []User{{}}}}
-		tp.updates <- Update{Message: &Message{UserLeft: &User{}}}
-		tp.updates <- Update{Message: &Message{NewGroupTitle: "title"}}
-		tp.updates <- Update{Message: &Message{NewGroupPhoto: &Photo{}}}
-		tp.updates <- Update{Message: &Message{GroupPhotoDeleted: true}}
-		tp.updates <- Update{Message: &Message{Chat: &Chat{ID: 1}, MigrateTo: 2}}
-		tp.updates <- Update{EditedMessage: &Message{Text: "edited"}}
-		tp.updates <- Update{ChannelPost: &Message{Text: "post"}}
-		tp.updates <- Update{ChannelPost: &Message{PinnedMessage: &Message{}}}
-		tp.updates <- Update{EditedChannelPost: &Message{Text: "edited post"}}
-		tp.updates <- Update{Callback: &Callback{MessageID: "inline", Data: "callback"}}
-		tp.updates <- Update{Callback: &Callback{Data: "callback"}}
-		tp.updates <- Update{Callback: &Callback{Data: "\funique|callback"}}
-		tp.updates <- Update{Query: &Query{Text: "query"}}
-		tp.updates <- Update{ChosenInlineResult: &ChosenInlineResult{ResultID: "result"}}
-		tp.updates <- Update{PreCheckoutQuery: &PreCheckoutQuery{ID: "checkout"}}
-		tp.updates <- Update{Poll: &Poll{ID: "poll"}}
-		tp.updates <- Update{PollAnswer: &PollAnswer{PollID: "poll"}}
-	}()
-
-	time.AfterFunc(100*time.Millisecond, b.Stop)
-	b.Start() // stops after some delay
+	b.ProcessUpdate(Update{Message: &Message{Text: "/start"}})
+	b.ProcessUpdate(Update{Message: &Message{Text: "/start@other_bot"}})
+	b.ProcessUpdate(Update{Message: &Message{Text: "hello"}})
+	b.ProcessUpdate(Update{Message: &Message{Text: "text"}})
+	b.ProcessUpdate(Update{Message: &Message{PinnedMessage: &Message{}}})
+	b.ProcessUpdate(Update{Message: &Message{Photo: &Photo{}}})
+	b.ProcessUpdate(Update{Message: &Message{Voice: &Voice{}}})
+	b.ProcessUpdate(Update{Message: &Message{Audio: &Audio{}}})
+	b.ProcessUpdate(Update{Message: &Message{Animation: &Animation{}}})
+	b.ProcessUpdate(Update{Message: &Message{Document: &Document{}}})
+	b.ProcessUpdate(Update{Message: &Message{Sticker: &Sticker{}}})
+	b.ProcessUpdate(Update{Message: &Message{Video: &Video{}}})
+	b.ProcessUpdate(Update{Message: &Message{VideoNote: &VideoNote{}}})
+	b.ProcessUpdate(Update{Message: &Message{Contact: &Contact{}}})
+	b.ProcessUpdate(Update{Message: &Message{Location: &Location{}}})
+	b.ProcessUpdate(Update{Message: &Message{Venue: &Venue{}}})
+	b.ProcessUpdate(Update{Message: &Message{Dice: &Dice{}}})
+	b.ProcessUpdate(Update{Message: &Message{GroupCreated: true}})
+	b.ProcessUpdate(Update{Message: &Message{UserJoined: &User{ID: 1}}})
+	b.ProcessUpdate(Update{Message: &Message{UsersJoined: []User{{ID: 1}}}})
+	b.ProcessUpdate(Update{Message: &Message{UserLeft: &User{}}})
+	b.ProcessUpdate(Update{Message: &Message{NewGroupTitle: "title"}})
+	b.ProcessUpdate(Update{Message: &Message{NewGroupPhoto: &Photo{}}})
+	b.ProcessUpdate(Update{Message: &Message{GroupPhotoDeleted: true}})
+	b.ProcessUpdate(Update{Message: &Message{Chat: &Chat{ID: 1}, MigrateTo: 2}})
+	b.ProcessUpdate(Update{EditedMessage: &Message{Text: "edited"}})
+	b.ProcessUpdate(Update{ChannelPost: &Message{Text: "post"}})
+	b.ProcessUpdate(Update{ChannelPost: &Message{PinnedMessage: &Message{}}})
+	b.ProcessUpdate(Update{EditedChannelPost: &Message{Text: "edited post"}})
+	b.ProcessUpdate(Update{Callback: &Callback{MessageID: "inline", Data: "callback"}})
+	b.ProcessUpdate(Update{Callback: &Callback{Data: "callback"}})
+	b.ProcessUpdate(Update{Callback: &Callback{Data: "\funique|callback"}})
+	b.ProcessUpdate(Update{Query: &Query{Text: "query"}})
+	b.ProcessUpdate(Update{ChosenInlineResult: &ChosenInlineResult{ResultID: "result"}})
+	b.ProcessUpdate(Update{PreCheckoutQuery: &PreCheckoutQuery{ID: "checkout"}})
+	b.ProcessUpdate(Update{Poll: &Poll{ID: "poll"}})
+	b.ProcessUpdate(Update{PollAnswer: &PollAnswer{PollID: "poll"}})
 }
 
 func TestBot(t *testing.T) {
@@ -304,87 +312,158 @@ func TestBot(t *testing.T) {
 	_, err = b.Forward(nil, nil)
 	assert.Equal(t, ErrBadRecipient, err)
 
-	t.Run("Send(what=Sendable)", func(t *testing.T) {
-		photo := &Photo{
-			File:    File{FileID: photoID},
-			Caption: t.Name(),
-		}
+	photo := &Photo{
+		File:    File{FileID: photoID},
+		Caption: t.Name(),
+	}
+	var msg *Message
 
-		msg, err := b.Send(to, photo)
-		assert.NoError(t, err)
+	t.Run("Send(what=Sendable)", func(t *testing.T) {
+		msg, err = b.Send(to, photo)
+		require.NoError(t, err)
 		assert.NotNil(t, msg.Photo)
 		assert.Equal(t, photo.Caption, msg.Caption)
 	})
 
-	var msg *Message
+	t.Run("SendAlbum()", func(t *testing.T) {
+		_, err = b.SendAlbum(nil, nil)
+		assert.Equal(t, ErrBadRecipient, err)
+
+		_, err = b.SendAlbum(to, nil)
+		assert.Error(t, err)
+
+		msgs, err := b.SendAlbum(to, Album{photo, photo})
+		require.NoError(t, err)
+		assert.Len(t, msgs, 2)
+		assert.NotEmpty(t, msgs[0].AlbumID)
+	})
+
+	t.Run("EditCaption()+ParseMode", func(t *testing.T) {
+		b.parseMode = ModeHTML
+
+		edited, err := b.EditCaption(msg, "<b>new caption with html</b>")
+		require.NoError(t, err)
+		assert.Equal(t, "new caption with html", edited.Caption)
+		assert.Equal(t, EntityBold, edited.CaptionEntities[0].Type)
+
+		edited, err = b.EditCaption(msg, "*new caption with markdown*", ModeMarkdown)
+		require.NoError(t, err)
+		assert.Equal(t, "new caption with markdown", edited.Caption)
+		assert.Equal(t, EntityBold, edited.CaptionEntities[0].Type)
+
+		b.parseMode = ModeDefault
+	})
+
+	t.Run("Edit(what=InputMedia)", func(t *testing.T) {
+		edited, err := b.Edit(msg, photo)
+		require.NoError(t, err)
+		assert.Equal(t, edited.Photo.UniqueID, photo.UniqueID)
+	})
 
 	t.Run("Send(what=string)", func(t *testing.T) {
 		msg, err = b.Send(to, t.Name())
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, t.Name(), msg.Text)
 
 		rpl, err := b.Reply(msg, t.Name())
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, rpl.Text, msg.Text)
 		assert.NotNil(t, rpl.ReplyTo)
 		assert.Equal(t, rpl.ReplyTo, msg)
 		assert.True(t, rpl.IsReply())
 
 		fwd, err := b.Forward(to, msg)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.NotNil(t, msg, fwd)
 		assert.True(t, fwd.IsForwarded())
 
 		fwd.ID += 1 // nonexistent message
-		fwd, err = b.Forward(to, fwd)
+		_, err = b.Forward(to, fwd)
 		assert.Equal(t, ErrToForwardNotFound, err)
 	})
 
 	t.Run("Edit(what=string)", func(t *testing.T) {
 		msg, err = b.Edit(msg, t.Name())
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, t.Name(), msg.Text)
 
 		_, err = b.Edit(msg, msg.Text)
 		assert.Error(t, err) // message is not modified
 	})
 
-	t.Run("Edit(what=Location)", func(t *testing.T) {
-		loc := &Location{Lat: 42, Lng: 69, LivePeriod: 60}
-		msg, err := b.Send(to, loc)
-		assert.NoError(t, err)
-		assert.NotNil(t, msg.Location)
+	t.Run("Edit(what=ReplyMarkup)", func(t *testing.T) {
+		good := &ReplyMarkup{
+			InlineKeyboard: [][]InlineButton{
+				{{
+					Data: "btn",
+					Text: "Hi Telebot!",
+				}},
+			},
+		}
+		bad := &ReplyMarkup{
+			InlineKeyboard: [][]InlineButton{
+				{{
+					Data: strings.Repeat("*", 65),
+					Text: "Bad Button",
+				}},
+			},
+		}
 
-		loc = &Location{Lat: loc.Lng, Lng: loc.Lat}
-		msg, err = b.Edit(msg, *loc)
-		assert.NoError(t, err)
-		assert.NotNil(t, msg.Location)
+		edited, err := b.Edit(msg, good)
+		require.NoError(t, err)
+		assert.Equal(t, edited.ReplyMarkup.InlineKeyboard, good.InlineKeyboard)
+
+		edited, err = b.EditReplyMarkup(edited, nil)
+		require.NoError(t, err)
+		assert.Nil(t, edited.ReplyMarkup.InlineKeyboard)
+
+		_, err = b.Edit(edited, bad)
+		assert.Equal(t, ErrButtonDataInvalid, err)
 	})
 
-	t.Run("EditReplyMarkup()", func(t *testing.T) {
-		markup := &ReplyMarkup{
-			InlineKeyboard: [][]InlineButton{{{
-				Data: "btn",
-				Text: "Hi Telebot!",
-			}}},
-		}
-		badMarkup := &ReplyMarkup{
-			InlineKeyboard: [][]InlineButton{{{
-				Data: strings.Repeat("*", 65),
-				Text: "Bad Button",
-			}}},
-		}
+	t.Run("Edit(what=Location)", func(t *testing.T) {
+		loc := &Location{Lat: 42, Lng: 69, LivePeriod: 60}
+		edited, err := b.Send(to, loc)
+		require.NoError(t, err)
+		assert.NotNil(t, edited.Location)
 
-		msg, err := b.EditReplyMarkup(msg, markup)
-		assert.NoError(t, err)
-		assert.Equal(t, msg.ReplyMarkup.InlineKeyboard, markup.InlineKeyboard)
+		loc = &Location{Lat: loc.Lng, Lng: loc.Lat}
+		edited, err = b.Edit(edited, *loc)
+		require.NoError(t, err)
+		assert.NotNil(t, edited.Location)
+	})
 
-		msg, err = b.EditReplyMarkup(msg, nil)
-		assert.NoError(t, err)
-		assert.Nil(t, msg.ReplyMarkup.InlineKeyboard)
+	// should be the last
+	t.Run("Delete()", func(t *testing.T) {
+		require.NoError(t, b.Delete(msg))
+	})
 
-		_, err = b.EditReplyMarkup(msg, badMarkup)
-		assert.Equal(t, ErrButtonDataInvalid, err)
+	t.Run("Notify()", func(t *testing.T) {
+		assert.Equal(t, ErrBadRecipient, b.Notify(nil, Typing))
+		require.NoError(t, b.Notify(to, Typing))
+	})
+
+	t.Run("Answer()", func(t *testing.T) {
+		assert.Error(t, b.Answer(&Query{}, &QueryResponse{
+			Results: Results{&ArticleResult{}},
+		}))
+	})
+
+	t.Run("Respond()", func(t *testing.T) {
+		assert.Error(t, b.Respond(&Callback{}, &CallbackResponse{}))
+	})
+
+	t.Run("Payments", func(t *testing.T) {
+		assert.NotPanics(t, func() {
+			b.Accept(&PreCheckoutQuery{})
+			b.Accept(&PreCheckoutQuery{}, "error")
+		})
+		assert.NotPanics(t, func() {
+			b.Ship(&ShippingQuery{})
+			b.Ship(&ShippingQuery{}, "error")
+			b.Ship(&ShippingQuery{}, ShippingOption{}, ShippingOption{})
+			assert.Equal(t, ErrUnsupportedWhat, b.Ship(&ShippingQuery{}, 0))
+		})
 	})
 
 	t.Run("Commands", func(t *testing.T) {
@@ -392,10 +471,10 @@ func TestBot(t *testing.T) {
 			Text:        "test",
 			Description: "test command",
 		}}
-		assert.NoError(t, b.SetCommands(orig))
+		require.NoError(t, b.SetCommands(orig))
 
 		cmds, err := b.GetCommands()
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, orig, cmds)
 	})
 }
